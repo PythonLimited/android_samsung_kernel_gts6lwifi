@@ -1,4 +1,4 @@
-/* Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -21,7 +21,6 @@
 #include <linux/of_device.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
-#include <linux/termios.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/uaccess.h>
@@ -57,7 +56,6 @@ struct uci_dev {
 	size_t actual_mtu; /* maximum size of incoming buffer */
 	int ref_count;
 	bool enabled;
-	u32 tiocm;
 	void *ipc_log;
 };
 
@@ -159,24 +157,11 @@ static long mhi_uci_ioctl(struct file *file,
 {
 	struct uci_dev *uci_dev = file->private_data;
 	struct mhi_device *mhi_dev = uci_dev->mhi_dev;
-	struct uci_chan *uci_chan = &uci_dev->dl_chan;
 	long ret = -ERESTARTSYS;
 
 	mutex_lock(&uci_dev->mutex);
-
-	if (cmd == TIOCMGET) {
-		spin_lock_bh(&uci_chan->lock);
-		ret = uci_dev->tiocm;
-		spin_unlock_bh(&uci_chan->lock);
-	} else if (uci_dev->enabled) {
+	if (uci_dev->enabled)
 		ret = mhi_ioctl(mhi_dev, cmd, arg);
-		if (!ret) {
-			spin_lock_bh(&uci_chan->lock);
-			uci_dev->tiocm = mhi_dev->tiocm;
-			spin_unlock_bh(&uci_chan->lock);
-		}
-	}
-
 	mutex_unlock(&uci_dev->mutex);
 
 	return ret;
@@ -239,16 +224,9 @@ static unsigned int mhi_uci_poll(struct file *file, poll_table *wait)
 	spin_lock_bh(&uci_chan->lock);
 	if (!uci_dev->enabled) {
 		mask = POLLERR;
-	} else {
-		if (!list_empty(&uci_chan->pending) || uci_chan->cur_buf) {
-			MSG_VERB("Client can read from node\n");
-			mask |= POLLIN | POLLRDNORM;
-		}
-
-		if (uci_dev->tiocm) {
-			MSG_VERB("Line status changed\n");
-			mask |= POLLPRI;
-		}
+	} else if (!list_empty(&uci_chan->pending) || uci_chan->cur_buf) {
+		MSG_VERB("Client can read from node\n");
+		mask |= POLLIN | POLLRDNORM;
 	}
 	spin_unlock_bh(&uci_chan->lock);
 
@@ -267,6 +245,8 @@ static unsigned int mhi_uci_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+static int read_raw_data = 0;
+
 static ssize_t mhi_uci_write(struct file *file,
 			     const char __user *buf,
 			     size_t count,
@@ -277,6 +257,7 @@ static ssize_t mhi_uci_write(struct file *file,
 	struct uci_chan *uci_chan = &uci_dev->ul_chan;
 	size_t bytes_xfered = 0;
 	int ret, nr_avail;
+	char cmd_id = 0xFF;
 
 	if (!buf || !count)
 		return -EINVAL;
@@ -329,6 +310,20 @@ static ssize_t mhi_uci_write(struct file *file,
 		else
 			flags = MHI_EOT;
 
+		cmd_id = *(char *)kbuf;
+		if (uci_dev->mhi_dev->ul_chan_id == 10) {
+			cmd_id = *(char *)kbuf;
+			if (cmd_id == 0xa)
+				read_raw_data = 1; /* data coming from the target is raw data */
+			else if ((read_raw_data == 1) && (cmd_id == 0x7)) /* data transfer has been finished */
+				read_raw_data = 0;
+			switch (cmd_id) {
+				case 0x2: MSG_LOG("EFS SAHARA Hello Response --->\n"); break;
+				case 0xa: MSG_LOG("EFS SAHARA Data Read Request --->\n"); break;
+				case 0x7: MSG_LOG("EFS SAHARA Reset --->\n"); break;
+			}
+		}
+
 		if (uci_dev->enabled)
 			ret = mhi_queue_transfer(mhi_dev, DMA_TO_DEVICE, kbuf,
 						 xfer_size, flags);
@@ -368,6 +363,7 @@ static ssize_t mhi_uci_read(struct file *file,
 	char *ptr;
 	size_t to_copy;
 	int ret = 0;
+	char cmd_id = 0xFF;
 
 	if (!buf)
 		return -EINVAL;
@@ -423,6 +419,18 @@ static ssize_t mhi_uci_read(struct file *file,
 	/* Copy the buffer to user space */
 	to_copy = min_t(size_t, count, uci_chan->rx_size);
 	ptr = uci_buf->data + (uci_buf->len - uci_chan->rx_size);
+
+	if (uci_dev->mhi_dev->ul_chan_id == 10) {
+		cmd_id = *(char *)ptr;
+		if (!read_raw_data) {
+			switch (cmd_id) {
+				case 0x1: MSG_LOG("EFS SAHARA <--- Hello \n"); break;
+				case 0x9: MSG_LOG("EFS SAHARA <--- Data Store Request \n"); break;
+				case 0x8: MSG_LOG("EFS SAHARA <--- Reset Response \n"); break;
+			}
+		}
+	}
+		
 	ret = copy_to_user(buf, ptr, to_copy);
 	if (ret)
 		return ret;
@@ -625,7 +633,7 @@ static int mhi_uci_probe(struct mhi_device *mhi_dev,
 	};
 
 	uci_dev->mtu = min_t(size_t, id->driver_data, mhi_dev->mtu);
-	uci_dev->actual_mtu = uci_dev->mtu -  sizeof(struct uci_buf);
+	uci_dev->actual_mtu = uci_dev->mtu - sizeof(struct uci_buf);
 	mhi_device_set_devdata(mhi_dev, uci_dev);
 	uci_dev->enabled = true;
 
@@ -681,20 +689,6 @@ static void mhi_dl_xfer_cb(struct mhi_device *mhi_dev,
 	wake_up(&uci_chan->wq);
 }
 
-static void mhi_status_cb(struct mhi_device *mhi_dev, enum MHI_CB reason)
-{
-	struct uci_dev *uci_dev = mhi_device_get_devdata(mhi_dev);
-	struct uci_chan *uci_chan = &uci_dev->dl_chan;
-	unsigned long flags;
-
-	if (reason == MHI_CB_DTR_SIGNAL) {
-		spin_lock_irqsave(&uci_chan->lock, flags);
-		uci_dev->tiocm = mhi_dev->tiocm;
-		spin_unlock_irqrestore(&uci_chan->lock, flags);
-		wake_up(&uci_chan->wq);
-	}
-}
-
 /* .driver_data stores max mtu */
 static const struct mhi_device_id mhi_uci_match_table[] = {
 	{ .chan = "LOOPBACK", .driver_data = 0x1000 },
@@ -713,7 +707,6 @@ static struct mhi_driver mhi_uci_driver = {
 	.probe = mhi_uci_probe,
 	.ul_xfer_cb = mhi_ul_xfer_cb,
 	.dl_xfer_cb = mhi_dl_xfer_cb,
-	.status_cb = mhi_status_cb,
 	.driver = {
 		.name = MHI_UCI_DRIVER_NAME,
 		.owner = THIS_MODULE,

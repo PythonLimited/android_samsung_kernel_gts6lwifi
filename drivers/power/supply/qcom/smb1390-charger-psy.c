@@ -1156,14 +1156,11 @@ static int smb1390_validate_slave_chg_taper(struct smb1390 *chip, int fcc_uA)
 		smb1390_dbg(chip, PR_INFO, "Set Master ILIM to MAX, post Slave disable in taper, fcc=%d\n",
 									fcc_uA);
 		vote_override(chip->ilim_votable, CC_MODE_VOTER,
-				smb1390_is_adapter_cc_mode(chip),
-				MAX_ILIM_DUAL_CP_UA);
-
+						true, MAX_ILIM_DUAL_CP_UA);
 		if (chip->usb_icl_votable)
 			vote_override(chip->usb_icl_votable,
 				      TAPER_MAIN_ICL_LIMIT_VOTER,
-				      smb1390_is_adapter_cc_mode(chip),
-				      chip->cc_mode_taper_main_icl_ua);
+				      true, chip->cc_mode_taper_main_icl_ua);
 	}
 
 	return rc;
@@ -1387,7 +1384,7 @@ static int smb1390_set_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CP_ILIM:
 		if (chip->ilim_votable)
 			vote_override(chip->ilim_votable, CC_MODE_VOTER,
-					(val->intval > 0), val->intval);
+							true, val->intval);
 		break;
 	default:
 		smb1390_dbg(chip, PR_MISC, "charge pump power supply set prop %d not supported\n",

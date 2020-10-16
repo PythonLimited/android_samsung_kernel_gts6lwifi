@@ -17,15 +17,15 @@
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM camera
 #undef TRACE_INCLUDE_PATH
-#define TRACE_INCLUDE_PATH .
+#define TRACE_INCLUDE_PATH ../../drivers/media/platform/msm/camera/cam_utils
 #undef TRACE_INCLUDE_FILE
 #define TRACE_INCLUDE_FILE cam_trace
 
 #include <linux/tracepoint.h>
 #include <media/cam_req_mgr.h>
-#include "cam_req_mgr_core.h"
-#include "cam_req_mgr_interface.h"
-#include "cam_context.h"
+#include "../cam_req_mgr/cam_req_mgr_core.h"
+#include "../cam_req_mgr/cam_req_mgr_interface.h"
+#include "../cam_core/cam_context.h"
 
 TRACE_EVENT(cam_context_state,
 	TP_PROTO(const char *name, struct cam_context *ctx),
@@ -41,7 +41,7 @@ TRACE_EVENT(cam_context_state,
 		__assign_str(name, name);
 	),
 	TP_printk(
-		"%s: State ctx=%p ctx_state=%u",
+		"%s: State ctx=%pK ctx_state=%u",
 			__get_str(name), __entry->ctx, __entry->state
 	)
 );
@@ -65,7 +65,7 @@ TRACE_EVENT(cam_isp_activated_irq,
 		__entry->ts = timestamp;
 	),
 	TP_printk(
-		"ISP: IRQ ctx=%p ctx_state=%u substate=%u event=%u ts=%llu",
+		"ISP: IRQ ctx=%pK ctx_state=%u substate=%u event=%u ts=%llu",
 			__entry->ctx, __entry->state, __entry->substate,
 			__entry->event, __entry->ts
 	)
@@ -103,7 +103,7 @@ TRACE_EVENT(cam_buf_done,
 		__entry->request = req->request_id;
 	),
 	TP_printk(
-		"%5s: BufDone ctx=%p request=%llu",
+		"%5s: BufDone ctx=%pK request=%llu",
 			__get_str(ctx_type), __entry->ctx, __entry->request
 	)
 );

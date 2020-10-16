@@ -40,6 +40,11 @@
 #include "sde_hw_top.h"
 #include "sde_hw_qdss.h"
 
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+#include <linux/interrupt.h>
+#include "ss_dsi_panel_common.h"
+#endif
+
 #define SDE_DEBUG_ENC(e, fmt, ...) SDE_DEBUG("enc%d " fmt,\
 		(e) ? (e)->base.base.id : -1, ##__VA_ARGS__)
 
@@ -83,7 +88,8 @@
 		(((x) == SDE_RM_TOPOLOGY_DUALPIPE_DSCMERGE) || \
 		((x) == SDE_RM_TOPOLOGY_DUALPIPE_3DMERGE) || \
 		((x) == SDE_RM_TOPOLOGY_DUALPIPE_3DMERGE_DSC))
-
+extern int smmu_fault_rec;
+int err_flag = 0;
 /**
  * enum sde_enc_rc_events - events for resource control state machine
  * @SDE_ENC_RC_EVENT_KICKOFF:
@@ -286,6 +292,9 @@ struct sde_encoder_virt {
 	bool recovery_events_enabled;
 	bool elevated_ahb_vote;
 	struct pm_qos_request pm_qos_cpu_req;
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	spinlock_t input_handler_lock;
+#endif
 };
 
 #define to_sde_encoder_virt(x) container_of(x, struct sde_encoder_virt, base)
@@ -585,6 +594,21 @@ int sde_encoder_helper_wait_for_irq(struct sde_encoder_phys *phys_enc,
 		if (ret)
 			break;
 	}
+
+	/*
+	* In some cases irq is disabled on specific cores ,
+	* display interrupts gets serviced just after timer expires.
+	* Wait after additional 2 ms delay so that interrupts are handled.
+	*/
+	if (intr_idx == INTR_IDX_PINGPONG && ret <= 0) {
+		mdelay(2);
+		SDE_EVT32(SDE_EVTLOG_FUNC_CASE1);
+		ret = _sde_encoder_wait_timeout(DRMID(phys_enc->parent),
+				irq->hw_idx,
+				(wait_info->timeout_ms/EVT_TIME_OUT_SPLIT),
+				wait_info);
+	}
+
 
 	if (ret <= 0) {
 		irq_status = sde_core_irq_read(phys_enc->sde_kms,
@@ -1106,6 +1130,7 @@ static int sde_encoder_virt_atomic_check(
 	if (!ret && sde_conn && drm_atomic_crtc_needs_modeset(crtc_state)) {
 		struct msm_display_topology *topology = NULL;
 
+		SDE_EVT32(sde_conn_state, ((unsigned long long)sde_conn_state) >> 32, 0x9999);
 		ret = sde_conn->ops.get_mode_info(&sde_conn->base, adj_mode,
 				&sde_conn_state->mode_info,
 				sde_kms->catalog->max_mixer_width,
@@ -1680,6 +1705,7 @@ static int _sde_encoder_dsc_setup(struct sde_encoder_virt *sde_enc,
 	struct drm_connector *drm_conn;
 	int ret = 0;
 
+	SDE_EVT32(sde_enc,params);
 	if (!sde_enc || !params || !sde_enc->phys_encs[0] ||
 			!sde_enc->phys_encs[0]->connector)
 		return -EINVAL;
@@ -1688,6 +1714,7 @@ static int _sde_encoder_dsc_setup(struct sde_encoder_virt *sde_enc,
 
 	topology = sde_connector_get_topology_name(drm_conn);
 	if (topology == SDE_RM_TOPOLOGY_NONE) {
+		SDE_EVT32(topology);
 		SDE_ERROR_ENC(sde_enc, "topology not set yet\n");
 		return -EINVAL;
 	}
@@ -1707,7 +1734,25 @@ static int _sde_encoder_dsc_setup(struct sde_encoder_virt *sde_enc,
 
 	if (sde_kms_rect_is_equal(&sde_enc->cur_conn_roi,
 			&sde_enc->prv_conn_roi))
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	{
+		/* QC display driver prevent DMS before without first frame update (commit).
+		 * In above case, it returns error for DMS and it causes kernel panic, in result.
+		 * To prevent the limitation, allow DMS before first frame update, and sets proper DSC setting.
+		 */
+		static bool first = true;
+
+		if (first) {
+			SDE_INFO("do not skip duplicated dsc setting in forst booting\n");
+			first = false;
+		} else {
+			return ret;
+		}
+	}
+
+#else
 		return ret;
+#endif
 
 	switch (topology) {
 	case SDE_RM_TOPOLOGY_SINGLEPIPE_DSC:
@@ -2001,7 +2046,7 @@ static int _sde_encoder_update_rsc_client(
 	 * to enable its VBLANK and wait one, since the RSC hardware is driven
 	 * by the primary panel's VBLANK signals
 	 */
-	SDE_EVT32_VERBOSE(DRMID(drm_enc), wait_vblank_crtc_id);
+	SDE_EVT32(DRMID(drm_enc), wait_vblank_crtc_id);
 	if (ret) {
 		SDE_ERROR_ENC(sde_enc,
 				"sde rsc client update failed ret:%d\n", ret);
@@ -2013,7 +2058,7 @@ static int _sde_encoder_update_rsc_client(
 	if (wait_vblank_crtc_id)
 		wait_refcount =
 			sde_rsc_client_get_vsync_refcount(sde_enc->rsc_client);
-	SDE_EVT32_VERBOSE(DRMID(drm_enc), wait_vblank_crtc_id, wait_refcount,
+	SDE_EVT32(DRMID(drm_enc), wait_vblank_crtc_id, wait_refcount,
 			SDE_EVTLOG_FUNC_ENTRY);
 
 	if (crtc->base.id != wait_vblank_crtc_id) {
@@ -2061,7 +2106,7 @@ static int _sde_encoder_update_rsc_client(
 
 	if (wait_refcount)
 		sde_rsc_client_reset_vsync_refcount(sde_enc->rsc_client);
-	SDE_EVT32_VERBOSE(DRMID(drm_enc), wait_vblank_crtc_id, wait_refcount,
+	SDE_EVT32(DRMID(drm_enc), wait_vblank_crtc_id, wait_refcount,
 			SDE_EVTLOG_FUNC_EXIT);
 
 	return ret;
@@ -2232,7 +2277,9 @@ static int _sde_encoder_resource_control_helper(struct drm_encoder *drm_enc,
 
 	return 0;
 }
-
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+static bool ss_input_handler_registered = false;
+#endif
 static void sde_encoder_input_event_handler(struct input_handle *handle,
 	unsigned int type, unsigned int code, int value)
 {
@@ -2240,6 +2287,9 @@ static void sde_encoder_input_event_handler(struct input_handle *handle,
 	struct sde_encoder_virt *sde_enc = NULL;
 	struct msm_drm_thread *disp_thread = NULL;
 	struct msm_drm_private *priv = NULL;
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	unsigned long lock_flags;
+#endif
 
 	if (!handle || !handle->handler || !handle->handler->private) {
 		SDE_ERROR("invalid encoder for the input event\n");
@@ -2263,9 +2313,18 @@ static void sde_encoder_input_event_handler(struct input_handle *handle,
 		return;
 	}
 
-	SDE_EVT32_VERBOSE(DRMID(drm_enc));
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	if(!ss_input_handler_registered)
+		return;
+	spin_lock_irqsave(&sde_enc->input_handler_lock, lock_flags);
+#endif
 
+	SDE_EVT32_VERBOSE(DRMID(drm_enc));
+	
 	disp_thread = &priv->disp_thread[sde_enc->crtc->index];
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	spin_unlock_irqrestore(&sde_enc->input_handler_lock, lock_flags);
+#endif
 
 	kthread_queue_work(&disp_thread->worker,
 				&sde_enc->input_event_work);
@@ -3188,6 +3247,9 @@ static void sde_encoder_virt_enable(struct drm_encoder *drm_enc)
 		SDE_ERROR("virt encoder has no master! num_phys %d\n", i);
 		return;
 	}
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	ss_input_handler_registered = true;
+#endif
 
 	/* register input handler if not already registered */
 	if (sde_enc->input_handler && !sde_enc->input_handler_registered &&
@@ -3272,6 +3334,9 @@ static void sde_encoder_virt_disable(struct drm_encoder *drm_enc)
 	struct sde_kms *sde_kms;
 	enum sde_intf_mode intf_mode;
 	int i = 0;
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	unsigned long lock_flags;
+#endif
 
 	if (!drm_enc) {
 		SDE_ERROR("invalid encoder\n");
@@ -3301,10 +3366,12 @@ static void sde_encoder_virt_disable(struct drm_encoder *drm_enc)
 	/* wait for idle */
 	sde_encoder_wait_for_event(drm_enc, MSM_ENC_TX_COMPLETE);
 
+#if !defined(CONFIG_DISPLAY_SAMSUNG)
 	if (sde_enc->input_handler && sde_enc->input_handler_registered) {
 		input_unregister_handler(sde_enc->input_handler);
 		sde_enc->input_handler_registered = false;
 	}
+#endif
 
 	/*
 	 * For primary command mode and video mode encoders, execute the
@@ -3326,7 +3393,6 @@ static void sde_encoder_virt_disable(struct drm_encoder *drm_enc)
 				phys->ops.disable(phys);
 		}
 	} else {
-
 		if ((intf_mode == INTF_MODE_WB_BLOCK ||
 			intf_mode == INTF_MODE_WB_LINE)
 			&& sde_enc->crtc && sde_enc->crtc->state &&
@@ -3356,6 +3422,11 @@ static void sde_encoder_virt_disable(struct drm_encoder *drm_enc)
 
 	sde_encoder_resource_control(drm_enc, SDE_ENC_RC_EVENT_STOP);
 
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	spin_lock_irqsave(&sde_enc->input_handler_lock, lock_flags);
+	ss_input_handler_registered = false;
+#endif
+
 	for (i = 0; i < sde_enc->num_phys_encs; i++) {
 		if (sde_enc->phys_encs[i]) {
 			sde_enc->phys_encs[i]->cont_splash_enabled = false;
@@ -3372,7 +3443,9 @@ static void sde_encoder_virt_disable(struct drm_encoder *drm_enc)
 	sde_enc->crtc = NULL;
 
 	SDE_DEBUG_ENC(sde_enc, "encoder disabled\n");
-
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	spin_unlock_irqrestore(&sde_enc->input_handler_lock, lock_flags);
+#endif
 	sde_rm_release(&sde_kms->rm, drm_enc);
 }
 
@@ -3439,6 +3512,7 @@ void sde_encoder_helper_phys_disable(struct sde_encoder_phys *phys_enc,
 
 	phys_enc->hw_ctl->ops.trigger_flush(phys_enc->hw_ctl);
 	phys_enc->hw_ctl->ops.trigger_start(phys_enc->hw_ctl);
+	SDE_EVT32(wb_enc);
 }
 
 static enum sde_intf sde_encoder_get_intf(struct sde_mdss_cfg *catalog,
@@ -3688,6 +3762,15 @@ static inline void _sde_encoder_trigger_flush(struct drm_encoder *drm_enc,
 		SDE_ERROR("invalid argument(s), drm_enc %d, phys_enc %d\n",
 				drm_enc != 0, phys != 0);
 		return;
+	}
+
+	if (smmu_fault_rec) {
+		while (1)
+			msleep(20);
+	}
+	if (err_flag) {
+		while (1)
+			msleep(20);
 	}
 
 	sde_enc = to_sde_encoder_virt(drm_enc);
@@ -4510,6 +4593,58 @@ static int _helper_flush_qsync(struct sde_encoder_phys *phys_enc)
 	return 0;
 }
 
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+#include <drm/drm_encoder.h>
+int ss_get_vdd_ndx_from_state(struct drm_atomic_state *old_state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
+	int i;
+
+	struct drm_encoder *encoder;
+	struct drm_device *dev;
+
+	struct sde_encoder_virt *sde_enc = NULL;
+	struct sde_encoder_phys *phys;
+
+	struct sde_connector *c_conn;
+	struct dsi_display *display;
+	struct samsung_display_driver_data *vdd;
+	int ndx = -EINVAL;
+
+
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		if (crtc->state->active) {
+			dev = crtc->dev;
+			list_for_each_entry(encoder, &dev->mode_config.encoder_list, head) {
+				if (encoder->crtc == crtc)
+					sde_enc = to_sde_encoder_virt(encoder);
+			}
+		}
+	}
+
+	if (!sde_enc)
+		return -ENODEV;
+
+	/* TOOD: remove below W/A and debug why panic occurs in video mode (DP) or writeback case */
+        if (sde_enc->disp_info.intf_type != DRM_MODE_CONNECTOR_DSI)
+                return PRIMARY_DISPLAY_NDX;
+
+
+	for (i = 0; i < sde_enc->num_phys_encs; i++) {
+		phys = sde_enc->phys_encs[i];
+		if (phys) {
+			c_conn = to_sde_connector(phys->connector);
+			display = c_conn->display;
+			vdd = display->panel->panel_private;
+			ndx = vdd->ndx;
+		}
+	}
+
+	return ndx;
+}
+#endif
+
 static bool _sde_encoder_dsc_is_dirty(struct sde_encoder_virt *sde_enc)
 {
 	int i;
@@ -4572,6 +4707,15 @@ int sde_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc,
 	SDE_DEBUG_ENC(sde_enc, "\n");
 	SDE_EVT32(DRMID(drm_enc));
 
+	if (smmu_fault_rec) {
+		while (1)
+			msleep(20);
+	}
+	if (err_flag) {
+		while (1)
+			msleep(20);
+	}
+
 	/* save this for later, in case of errors */
 	if (sde_enc->cur_master && sde_enc->cur_master->ops.get_wr_line_count)
 		ln_cnt1 = sde_enc->cur_master->ops.get_wr_line_count(
@@ -4629,6 +4773,7 @@ int sde_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc,
 		}
 	}
 
+	SDE_EVT32(DRMID(drm_enc), 1);
 	_sde_encoder_update_master(drm_enc, params);
 
 	_sde_encoder_update_roi(drm_enc);
@@ -4643,8 +4788,17 @@ int sde_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc,
 		}
 	}
 
+	SDE_EVT32(_sde_encoder_is_dsc_enabled(drm_enc), sde_enc->cur_master, sde_enc->cur_master->cont_splash_enabled);
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	/* QC display driver prevent DMS before without first frame update (commit).
+	 * In above case, it returns error for DMS and it causes kernel panic, in result.
+	 * To prevent the limitation, allow DMS before first frame update, and sets proper DSC setting.
+	 */
+	if (_sde_encoder_is_dsc_enabled(drm_enc) && sde_enc->cur_master) {
+#else
 	if (_sde_encoder_is_dsc_enabled(drm_enc) && sde_enc->cur_master &&
 			!sde_enc->cur_master->cont_splash_enabled) {
+#endif
 		rc = _sde_encoder_dsc_setup(sde_enc, params);
 		if (rc) {
 			SDE_ERROR_ENC(sde_enc, "failed to setup DSC: %d\n", rc);
@@ -4659,6 +4813,7 @@ int sde_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc,
 				sde_enc->cur_master, sde_kms->qdss_enabled);
 
 end:
+	SDE_EVT32(0XFFFF);
 	SDE_ATRACE_END("sde_encoder_prepare_for_kickoff");
 	return ret;
 }
@@ -5410,6 +5565,9 @@ struct drm_encoder *sde_encoder_init_with_ops(
 	}
 
 	mutex_init(&sde_enc->rc_lock);
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+	spin_lock_init(&sde_enc->input_handler_lock);
+#endif
 	kthread_init_delayed_work(&sde_enc->delayed_off_work,
 			sde_encoder_off_work);
 	sde_enc->vblank_enabled = false;
@@ -5610,6 +5768,7 @@ int sde_encoder_update_caps_for_cont_splash(struct drm_encoder *encoder,
 		return -EINVAL;
 	}
 
+	SDE_EVT32(sde_conn_state, ((unsigned long long)sde_conn_state) >> 32, 0x9999);
 	ret = sde_conn->ops.get_mode_info(&sde_conn->base,
 			&encoder->crtc->state->adjusted_mode,
 			&sde_conn_state->mode_info,

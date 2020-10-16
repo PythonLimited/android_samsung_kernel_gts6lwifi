@@ -78,6 +78,7 @@
 #define IPA_CHANNEL_STOP_IN_PROC_TO_MSEC 5
 #define IPA_CHANNEL_STOP_IN_PROC_SLEEP_USEC 200
 #define IPA_MHIP_HOLB_TMO 500 /* 500ms this should be less than tag timeout */
+#define IPA_MPM_NUM_OF_INIT_CMD_DESC 2
 
 enum mhip_re_type {
 	MHIP_RE_XFER = 0x2,
@@ -474,11 +475,55 @@ static void ipa_mpm_gsi_chan_err_cb(struct gsi_chan_err_notify *err_data)
 static int ipa_mpm_set_dma_mode(enum ipa_client_type src_pipe,
 	enum ipa_client_type dst_pipe, bool reset)
 {
-	int result = 0;
+	struct ipahal_imm_cmd_pyld *cmd_pyld[IPA_MPM_NUM_OF_INIT_CMD_DESC];
+	struct ipahal_imm_cmd_register_write reg_write_coal_close;
+	struct ipahal_reg_valmask valmask;
+	struct ipa3_desc desc[IPA_MPM_NUM_OF_INIT_CMD_DESC];
+	int i, num_cmd = 0, result = 0;
 	struct ipa_ep_cfg ep_cfg = { { 0 } };
 
 	IPA_MPM_FUNC_ENTRY();
 	IPA_MPM_DBG("DMA from %d to %d reset=%d\n", src_pipe, dst_pipe, reset);
+
+	memset(desc, 0, sizeof(desc));
+	memset(cmd_pyld, 0, sizeof(cmd_pyld));
+
+	/* First step is to clear IPA Pipeline before changing DMA mode */
+	if (ipa3_get_ep_mapping(src_pipe) != IPA_EP_NOT_ALLOCATED) {
+		i = ipa3_get_ep_mapping(src_pipe);
+		reg_write_coal_close.skip_pipeline_clear = false;
+		reg_write_coal_close.pipeline_clear_options = IPAHAL_HPS_CLEAR;
+		reg_write_coal_close.offset = ipahal_get_reg_ofst(
+			IPA_AGGR_FORCE_CLOSE);
+		ipahal_get_aggr_force_close_valmask(i, &valmask);
+		reg_write_coal_close.value = valmask.val;
+		reg_write_coal_close.value_mask = valmask.mask;
+		cmd_pyld[num_cmd] = ipahal_construct_imm_cmd(
+					IPA_IMM_CMD_REGISTER_WRITE,
+					&reg_write_coal_close, false);
+
+		if (!cmd_pyld[num_cmd]) {
+			IPA_MPM_ERR("failed to construct coal close IC\n");
+			result = -ENOMEM;
+			goto destroy_imm_cmd;
+		}
+		ipa3_init_imm_cmd_desc(&desc[num_cmd], cmd_pyld[num_cmd]);
+		++num_cmd;
+	}
+	/* NO-OP IC for ensuring that IPA pipeline is empty */
+	cmd_pyld[num_cmd] =
+		ipahal_construct_nop_imm_cmd(false, IPAHAL_HPS_CLEAR, false);
+	if (!cmd_pyld[num_cmd]) {
+		IPA_MPM_ERR("failed to construct NOP imm cmd\n");
+		result = -ENOMEM;
+		goto destroy_imm_cmd;
+	}
+
+	result = ipa3_send_cmd(num_cmd, desc);
+	if (result) {
+		IPAERR("fail to send Reset Pipeline immediate command\n");
+		goto destroy_imm_cmd;
+	}
 
 	/* Reset to basic if reset = 1, otherwise set to DMA */
 	if (reset)
@@ -490,6 +535,10 @@ static int ipa_mpm_set_dma_mode(enum ipa_client_type src_pipe,
 
 	result = ipa_cfg_ep(ipa_get_ep_mapping(src_pipe), &ep_cfg);
 	IPA_MPM_FUNC_EXIT();
+
+destroy_imm_cmd:
+	for (i = 0; i < num_cmd; ++i)
+		ipahal_destroy_imm_cmd(cmd_pyld[i]);
 
 	return result;
 }
@@ -2187,12 +2236,20 @@ static int ipa_mpm_mhi_probe_cb(struct mhi_device *mhi_dev,
 	case IPA_MPM_TETH_INIT:
 		if (ul_prod != IPA_CLIENT_MAX) {
 			/* No teth started yet, disable UL channel */
-			ret = ipa3_stop_gsi_channel(ipa_ep_idx);
-			if (ret) {
-				IPA_MPM_ERR("MHIP Stop channel err = %d\n",
-					ret);
+			ipa_ep_idx = ipa3_get_ep_mapping(ul_prod);
+			if (ipa_ep_idx == IPA_EP_NOT_ALLOCATED) {
+				IPA_MPM_ERR("fail to alloc EP.\n");
 				goto fail_stop_channel;
 			}
+ 			ret = ipa3_stop_gsi_channel(ipa_ep_idx);
+ 			if (ret) {
+ 				IPA_MPM_ERR("MHIP Stop channel err = %d\n",
+ 					ret);
+ 				goto fail_stop_channel;
+ 			}
+			ipa_mpm_change_gsi_state(probe_id,
+				IPA_MPM_MHIP_CHAN_UL,
+				GSI_STOPPED);
 		}
 		if (is_acted)
 			ipa_mpm_vote_unvote_pcie_clk(CLK_OFF, probe_id,
@@ -2202,7 +2259,6 @@ static int ipa_mpm_mhi_probe_cb(struct mhi_device *mhi_dev,
 	case IPA_MPM_TETH_CONNECTED:
 		IPA_MPM_DBG("UL channel is already started, continue\n");
 		ipa_mpm_change_teth_state(probe_id, IPA_MPM_TETH_CONNECTED);
-
 
 		if (probe_id == IPA_MPM_MHIP_CH_ID_1) {
 			/* Lift the delay for rmnet USB prod pipe */
@@ -2217,12 +2273,20 @@ static int ipa_mpm_mhi_probe_cb(struct mhi_device *mhi_dev,
 	}
 
 	atomic_inc(&ipa_mpm_ctx->probe_cnt);
-	/* Check if ODL pipe is connected to MHIP DPL pipe before probe */
-	if (probe_id == IPA_MPM_MHIP_CH_ID_2 &&
-		ipa3_is_odl_connected()) {
-		IPA_MPM_ERR("setting DPL DMA to ODL\n");
-		ret = ipa_mpm_set_dma_mode(IPA_CLIENT_MHI_PRIME_DPL_PROD,
-			IPA_CLIENT_USB_DPL_CONS, false);
+	/* Check if ODL/USB DPL pipe is connected before probe */
+	if (probe_id == IPA_MPM_MHIP_CH_ID_2) {
+		if (ipa3_is_odl_connected())
+			ret = ipa_mpm_set_dma_mode(
+							IPA_CLIENT_MHI_PRIME_DPL_PROD,
+							IPA_CLIENT_ODL_DPL_CONS, false);
+		else if (atomic_read(&ipa_mpm_ctx->adpl_over_usb_available))
+			ret = ipa_mpm_set_dma_mode(
+							IPA_CLIENT_MHI_PRIME_DPL_PROD,
+							IPA_CLIENT_USB_DPL_CONS, false);
+	if (ret)
+		IPA_MPM_ERR("DPL DMA to ODL/USB failed, ret = %d\n",
+		ret);
+
 	}
 	mutex_lock(&ipa_mpm_ctx->md[probe_id].mutex);
 	ipa_mpm_ctx->md[probe_id].init_complete = true;

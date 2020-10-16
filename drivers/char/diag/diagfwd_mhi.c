@@ -231,10 +231,9 @@ static int __mhi_close(struct diag_mhi_info *mhi_info, int close_flag)
 	atomic_set(&(mhi_info->read_ch.opened), 0);
 	atomic_set(&(mhi_info->write_ch.opened), 0);
 
+	flush_workqueue(mhi_info->mhi_wq);
 	cancel_work(&mhi_info->read_work);
 	cancel_work(&mhi_info->read_done_work);
-	flush_workqueue(mhi_info->mhi_wq);
-
 	if (close_flag == CLOSE_CHANNELS) {
 		mutex_lock(&mhi_info->ch_mutex);
 		mhi_unprepare_from_transfer(mhi_info->mhi_dev);
@@ -320,8 +319,6 @@ fail:
 
 static int mhi_open(int id)
 {
-	int err = 0;
-
 	if (id < 0 || id >= NUM_MHI_DEV) {
 		pr_err("diag: In %s, invalid index %d\n", __func__, id);
 		return -EINVAL;
@@ -332,9 +329,7 @@ static int mhi_open(int id)
 	 * explicitly by Diag. Open both the read and write channels (denoted by
 	 * OPEN_CHANNELS flag)
 	 */
-	err = __mhi_open(&diag_mhi[id], OPEN_CHANNELS);
-	if (err)
-		return err;
+	__mhi_open(&diag_mhi[id], OPEN_CHANNELS);
 	diag_remote_dev_open(diag_mhi[id].dev_id);
 	queue_work(diag_mhi[id].mhi_wq, &(diag_mhi[id].read_work));
 
